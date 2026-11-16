@@ -1,5 +1,7 @@
 import { MODULE_BY_KEY } from '@/data/modules'
 import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
+import { changeSchedulerStatus, lineageForTask, resetSchedulerData } from '@/api/scheduler-service'
+import type { SchedulerAction } from '@/data/scheduler'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
@@ -30,6 +32,13 @@ export function listEntries(key: string, filters: Record<string, string> = {}): 
 
 export function runAction(key: string, id: number, action: string): ActionResult {
   const meta = moduleMeta(key)
+  // 定时作业的状态流转带调度副作用（清理旧触发、重算下次运行时间），统一交给调度服务。
+  if (key === 'schedulerjob') {
+    if (!(action in meta.actionTargets)) {
+      return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
+    }
+    return changeSchedulerStatus(id, action as SchedulerAction)
+  }
   const target = meta.actionTargets[action]
   if (!target) {
     return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
@@ -58,15 +67,34 @@ export function runAction(key: string, id: number, action: string): ActionResult
 
 export function resetModule(key: string): PageResult {
   resetRows(key)
+  // 定时作业重置时一并清掉运行记录、结果数据集与事件，避免旧运行挂到新配置上。
+  if (key === 'schedulerjob') {
+    resetSchedulerData()
+  }
   return listEntries(key)
 }
 
 export function exportEntries(key: string): { filename: string; content: string } {
   const meta = moduleMeta(key)
-  const header = ['编号', ...meta.fields, '当前状态']
+  // 数据导出与定时查询结果数据集同源：清单同步作业编号、作业版本与查询版本，便于回查来源。
+  const withLineage = key === 'exporttask'
+  const header = withLineage
+    ? ['编号', ...meta.fields, '当前状态', '作业编号', '作业版本', '关联查询版本', '作业运行编号', '运行时间']
+    : ['编号', ...meta.fields, '当前状态']
   const lines = [header.join(',')]
   for (const row of listRows(key)) {
-    lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].join(','))
+    const base: (string | number | boolean)[] = [row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status]
+    if (withLineage) {
+      const run = lineageForTask(row)
+      base.push(
+        run?.jobCode ?? '',
+        run?.jobVersion ?? '',
+        run?.queryVersion ?? '',
+        run?.runId ?? '',
+        run?.scheduledAt ?? '',
+      )
+    }
+    lines.push(base.join(','))
   }
   return { filename: `${meta.name}-清单.csv`, content: `\uFEFF${lines.join('\n')}` }
 }
